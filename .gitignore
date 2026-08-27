@@ -1,0 +1,10 @@
+node_modules/
+dist/
+build/
+.env
+*.log
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+ml-service/app/models/*.joblib
