@@ -1,85 +1,380 @@
 import { Response } from "express";
 import { supabase } from "../config/supabase";
 import { AuthReq } from "../middleware/auth";
-import { mlHealth } from "../services/mlClient";
 
-export async function alerts(_req: AuthReq, res: Response) {
-  const { data } = await supabase.from("alerts").select("*, patients(patient_code)").order("created_at", { ascending: false }).limit(200);
-  res.json(data || []);
-}
+/**
+ * Get active alerts.
+ */
+export async function alerts(
+  req: AuthReq,
+  res: Response
+) {
+  try {
+    const { data, error } = await supabase
+      .from("alerts")
+      .select(`
+        *,
+        patients (
+          id,
+          patient_code,
+          age,
+          sex,
+          chief_complaint,
+          status
+        )
+      `)
+      .eq("status", "active")
+      .order("created_at", {
+        ascending: false,
+      });
 
-export async function resolveAlert(req: AuthReq, res: Response) {
-  await supabase.from("alerts").update({ status: "resolved", resolved_at: new Date().toISOString() }).eq("id", req.params.id);
-  res.json({ ok: true });
-}
+    if (error) {
+      console.error("Alerts query error:", error);
 
-export async function auditLogs(_req: AuthReq, res: Response) {
-  const { data } = await supabase.from("audit_logs").select("*").order("created_at", { ascending: false }).limit(500);
-  res.json(data || []);
-}
-
-export async function analytics(_req: AuthReq, res: Response) {
-  const { data: patients } = await supabase.from("patients").select("*");
-  const { data: triages } = await supabase.from("triage_assessments").select("*");
-  const { data: alertsData } = await supabase.from("alerts").select("*");
-  const { data: reass } = await supabase.from("reassessments").select("*");
-
-  const now = Date.now();
-  const waits = (patients || []).map(p => Math.floor((now - new Date(p.arrival_time).getTime())/60000));
-  const avgWait = waits.length ? Math.round(waits.reduce((a,b)=>a+b,0)/waits.length) : 0;
-  const longestWait = waits.length ? Math.max(...waits) : 0;
-
-  const latestByPatient: Record<string, any> = {};
-  (triages || []).forEach(t => {
-    if (!latestByPatient[t.patient_id] || new Date(t.created_at) > new Date(latestByPatient[t.patient_id].created_at)) {
-      latestByPatient[t.patient_id] = t;
+      return res.status(500).json({
+        error: "Failed to fetch alerts",
+      });
     }
-  });
-  const latest = Object.values(latestByPatient) as any[];
 
-  const priorityDist = [1,2,3,4,5].map(p => ({ priority: "P" + p, count: latest.filter(t=>t.priority===p).length }));
-  const riskDist = ["LOW","MEDIUM","HIGH"].map(r => ({ risk: r, count: latest.filter(t=>t.deterioration_risk===r).length }));
-  const avgConfidence = latest.length ? latest.reduce((s,t)=>s+Number(t.confidence),0)/latest.length : 0;
-  const highRisk = latest.filter(t=>t.deterioration_risk==="HIGH").length;
-  const p1p2 = latest.filter(t=>t.priority<=2).length;
+    return res.json(data || []);
+  } catch (error) {
+    console.error("alerts error:", error);
 
-  res.json({
-    kpi: {
-      total_patients: patients?.length || 0,
-      critical: latest.filter(t=>t.priority===1).length,
-      waiting: (patients || []).filter(p=>p.status==="Waiting").length,
-      high_risk: highRisk,
-      avg_wait: avgWait,
-      longest_wait: longestWait,
-      p1_p2_count: p1p2,
-      capacity: Math.min(100, Math.round(((patients?.length||0)/40)*100)),
-      avg_confidence: Number(avgConfidence.toFixed(2)),
-      active_alerts: (alertsData || []).filter(a=>a.status==="active").length,
-      reassessments: reass?.length || 0
-    },
-    priority_distribution: priorityDist,
-    risk_distribution: riskDist,
-    confidence_buckets: [
-      { bucket: "Low (<60%)", count: latest.filter(t=>Number(t.confidence)<0.6).length },
-      { bucket: "Med (60-80%)", count: latest.filter(t=>Number(t.confidence)>=0.6&&Number(t.confidence)<0.8).length },
-      { bucket: "High (>80%)", count: latest.filter(t=>Number(t.confidence)>=0.8).length }
-    ],
-    waiting_by_priority: [1,2,3,4,5].map(p => {
-      const pts = (patients || []).filter(pt => (latestByPatient[pt.id]?.priority) === p);
-      const w = pts.map(pt => Math.floor((now - new Date(pt.arrival_time).getTime())/60000));
-      return { priority: "P" + p, avg: w.length ? Math.round(w.reduce((a,b)=>a+b,0)/w.length) : 0 };
-    })
-  });
+    return res.status(500).json({
+      error: "Failed to fetch alerts",
+    });
+  }
 }
 
-export async function systemHealth(_req: AuthReq, res: Response) {
-  const ml = await mlHealth();
-  const { error: dbErr } = await supabase.from("users").select("id").limit(1);
-  res.json({
-    backend: { status: "operational", latency_ms: 12 },
-    database: { status: dbErr ? "unavailable" : "operational" },
-    ml_service: { status: ml.status === "operational" ? "operational" : "unavailable", model_loaded: ml.model_loaded, version: ml.version },
-    ai_service: { status: process.env.LLM_API_KEY ? "operational" : "degraded", note: process.env.LLM_API_KEY ? "" : "Using deterministic fallback (no LLM_API_KEY)" },
-    simulation_engine: { status: "operational" }
-  });
+/**
+ * Resolve an active alert.
+ */
+export async function resolveAlert(
+  req: AuthReq,
+  res: Response
+) {
+  try {
+    const { id } = req.params;
+
+    if (!id) {
+      return res.status(400).json({
+        error: "Alert ID is required",
+      });
+    }
+
+    const { data, error } = await supabase
+      .from("alerts")
+      .update({
+        status: "resolved",
+        resolved_at: new Date().toISOString(),
+      })
+      .eq("id", id)
+      .eq("status", "active")
+      .select()
+      .single();
+
+    if (error) {
+      console.error(
+        "Resolve alert error:",
+        error
+      );
+
+      return res.status(400).json({
+        error: error.message,
+      });
+    }
+
+    if (!data) {
+      return res.status(404).json({
+        error: "Active alert not found",
+      });
+    }
+
+    const { error: auditError } =
+      await supabase
+        .from("audit_logs")
+        .insert({
+          user_id: req.user?.id,
+          user_email: req.user?.email,
+          user_role: req.user?.role,
+          patient_id: data.patient_id,
+          action: "ALERT_RESOLVED",
+          details: {
+            alert_id: id,
+          },
+        });
+
+    if (auditError) {
+      console.error(
+        "Audit log failed:",
+        auditError
+      );
+    }
+
+    return res.json({
+      ok: true,
+      alert: data,
+    });
+  } catch (error) {
+    console.error(
+      "resolveAlert error:",
+      error
+    );
+
+    return res.status(500).json({
+      error: "Failed to resolve alert",
+    });
+  }
+}
+
+/**
+ * Get audit logs.
+ */
+export async function auditLogs(
+  req: AuthReq,
+  res: Response
+) {
+  try {
+    const limit = Math.min(
+      Math.max(
+        Number(req.query.limit) || 100,
+        1
+      ),
+      500
+    );
+
+    const { data, error } = await supabase
+      .from("audit_logs")
+      .select("*")
+      .order("created_at", {
+        ascending: false,
+      })
+      .limit(limit);
+
+    if (error) {
+      console.error(
+        "Audit logs query error:",
+        error
+      );
+
+      return res.status(500).json({
+        error: "Failed to fetch audit logs",
+      });
+    }
+
+    return res.json(data || []);
+  } catch (error) {
+    console.error(
+      "auditLogs error:",
+      error
+    );
+
+    return res.status(500).json({
+      error: "Failed to fetch audit logs",
+    });
+  }
+}
+
+/**
+ * Basic analytics for the dashboard.
+ */
+export async function analytics(
+  req: AuthReq,
+  res: Response
+) {
+  try {
+    const [
+      patientsResult,
+      assessmentsResult,
+      alertsResult,
+    ] = await Promise.all([
+      supabase
+        .from("patients")
+        .select(
+          "id, status, is_simulated, created_at"
+        ),
+
+      supabase
+        .from("triage_assessments")
+        .select(
+          "id, priority, risk_probability, created_at"
+        ),
+
+      supabase
+        .from("alerts")
+        .select(
+          "id, severity, status, created_at"
+        ),
+    ]);
+
+    if (patientsResult.error) {
+      console.error(
+        "Patients analytics error:",
+        patientsResult.error
+      );
+
+      return res.status(500).json({
+        error: "Failed to fetch patient analytics",
+      });
+    }
+
+    if (assessmentsResult.error) {
+      console.error(
+        "Assessments analytics error:",
+        assessmentsResult.error
+      );
+
+      return res.status(500).json({
+        error: "Failed to fetch assessment analytics",
+      });
+    }
+
+    if (alertsResult.error) {
+      console.error(
+        "Alerts analytics error:",
+        alertsResult.error
+      );
+
+      return res.status(500).json({
+        error: "Failed to fetch alert analytics",
+      });
+    }
+
+    const patients =
+      patientsResult.data || [];
+
+    const assessments =
+      assessmentsResult.data || [];
+
+    const alertsData =
+      alertsResult.data || [];
+
+    const patientsByStatus = patients.reduce(
+      (acc: Record<string, number>, patient: any) => {
+        const status =
+          patient.status || "Unknown";
+
+        acc[status] =
+          (acc[status] || 0) + 1;
+
+        return acc;
+      },
+      {}
+    );
+
+    const assessmentsByPriority =
+      assessments.reduce(
+        (
+          acc: Record<string, number>,
+          assessment: any
+        ) => {
+          const priority =
+            String(
+              assessment.priority ?? "Unknown"
+            );
+
+          acc[priority] =
+            (acc[priority] || 0) + 1;
+
+          return acc;
+        },
+        {}
+      );
+
+    const activeAlerts =
+      alertsData.filter(
+        (alert: any) =>
+          alert.status === "active"
+      ).length;
+
+    const simulatedPatients =
+      patients.filter(
+        (patient: any) =>
+          patient.is_simulated === true
+      ).length;
+
+    return res.json({
+      patients: {
+        total: patients.length,
+        simulated: simulatedPatients,
+        by_status: patientsByStatus,
+      },
+
+      assessments: {
+        total: assessments.length,
+        by_priority: assessmentsByPriority,
+      },
+
+      alerts: {
+        total: alertsData.length,
+        active: activeAlerts,
+      },
+    });
+  } catch (error) {
+    console.error(
+      "analytics error:",
+      error
+    );
+
+    return res.status(500).json({
+      error: "Failed to fetch analytics",
+    });
+  }
+}
+
+/**
+ * Basic system health information.
+ */
+export async function systemHealth(
+  req: AuthReq,
+  res: Response
+) {
+  try {
+    const start = Date.now();
+
+    const { error } = await supabase
+      .from("patients")
+      .select("id")
+      .limit(1);
+
+    const databaseLatency =
+      Date.now() - start;
+
+    if (error) {
+      console.error(
+        "System health database error:",
+        error
+      );
+
+      return res.status(503).json({
+        status: "degraded",
+        database: {
+          status: "unavailable",
+          latency_ms: databaseLatency,
+        },
+      });
+    }
+
+    return res.json({
+      status: "operational",
+      database: {
+        status: "operational",
+        latency_ms: databaseLatency,
+      },
+      timestamp:
+        new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error(
+      "systemHealth error:",
+      error
+    );
+
+    return res.status(503).json({
+      status: "degraded",
+      database: {
+        status: "unavailable",
+      },
+    });
+  }
 }
